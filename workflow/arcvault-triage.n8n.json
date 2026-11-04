@@ -1,0 +1,358 @@
+{
+  "name": "ArcVault Intake & Triage",
+  "nodes": [
+    {
+      "id": "1ccb1950-4c11-5b9f-8e77-656161a21456",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -360
+      ],
+      "parameters": {
+        "width": 820,
+        "height": 260,
+        "content": "## ArcVault intake & triage\n**1 Ingest** webhook  ->  **2 Classify** (LLM)  ->  **3 Enrich + summary** (LLM)  ->  **4-6 Route, escalate, build record** (plain code, no LLM)  ->  deliver to queue + return JSON\n\n- LLM: Groq `llama-3.3-70b-versatile`, temperature 0, JSON mode\n- Escalate if confidence < 0.70, Incident/Outage, escalation phrase, or billing discrepancy > $500\n- Setup: create a **Header Auth** credential `Groq API` (Name `Authorization`, Value `Bearer <key>`) and select it on both LLM nodes; paste your webhook.site URL into both Deliver nodes."
+      }
+    },
+    {
+      "id": "4036f942-b915-5f9e-bec4-2b94a62313e5",
+      "name": "Inbound Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "dd8de232-bdfe-510c-9053-ee4a344b1bee",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "arcvault-intake",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "ff0a85ee-766c-5097-872d-51cb25a1b865",
+      "name": "Prepare Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// STEP 1 (Ingestion) + request builder for STEP 2 (Classification)\n// Mode: Run Once for Each Item. Normalises whatever arrived at the webhook\n// into one internal shape, then builds the Groq chat-completions request.\n\nconst MODEL = 'llama-3.3-70b-versatile';\n\nconst SYSTEM_PROMPT = `You are the intake classifier for ArcVault, a B2B software company. You read one inbound customer message and classify it so it can be routed to the right team.\n\n## Categories (choose exactly one)\n- \"Bug Report\": something in the product is broken or behaves incorrectly for this customer (errors, failed actions, wrong results). Usually one user or one account.\n- \"Feature Request\": the customer asks for a capability that does not exist today (\"we'd love\", \"it would be great if\", \"please add\").\n- \"Billing Issue\": invoices, charges, payments, refunds, pricing or contract-rate questions.\n- \"Technical Question\": how-to, configuration, integration or capability questions where nothing is broken (\"is there a way to\", \"how do I\", \"do you support\").\n- \"Incident/Outage\": the service or a major part of it is unavailable or degraded for many users or the whole organisation (\"down\", \"not loading for everyone\", \"multiple users affected\").\n\n## Tie-breaking rules\n- Broken for one user/account -> \"Bug Report\". Broken for many users/an entire org, or the customer says it is on ArcVault's side -> \"Incident/Outage\".\n- Asking whether something is possible -> \"Technical Question\", even if the answer might turn out to be \"no, but we could build it\".\n- If money or invoices are the main subject -> \"Billing Issue\", even if a bug caused it.\n\n## Priority (choose exactly one)\n- \"High\": customers are blocked from using the product, many users affected, data/security risk, or financial impact on the customer.\n- \"Medium\": a real problem with a workaround or limited scope, or a billing discrepancy that needs correcting.\n- \"Low\": requests, questions and ideas with no current impact.\n\n## Confidence\nA number from 0.0 to 1.0 describing how sure you are of the CATEGORY:\n- 0.90-1.00: the message clearly matches one category and no other category is plausible.\n- 0.70-0.89: one category is most likely but another is plausible.\n- below 0.70: the message is ambiguous, off-topic, too short, or fits two categories about equally.\nDo not default to high confidence. Lower it whenever a tie-breaking rule was needed.\n\n## Output\nReturn ONLY a JSON object, no prose, with exactly these keys in this order:\n{\n  \"rationale\": \"one or two sentences explaining the decision, citing words from the message\",\n  \"category\": \"Bug Report | Feature Request | Billing Issue | Technical Question | Incident/Outage\",\n  \"secondary_category\": \"the next most plausible category, or null\",\n  \"priority\": \"Low | Medium | High\",\n  \"confidence\": 0.0\n}\n\n## Examples\nMessage: \"Exports to CSV have been timing out since this morning for my account only.\"\n{\"rationale\":\"A product function (CSV export) is failing for a single account, so it is a defect rather than an outage.\",\"category\":\"Bug Report\",\"secondary_category\":\"Incident/Outage\",\"priority\":\"Medium\",\"confidence\":0.86}\n\nMessage: \"Can we get dark mode please? Our team works late.\"\n{\"rationale\":\"Asks for a new capability ('can we get dark mode') with no current breakage.\",\"category\":\"Feature Request\",\"secondary_category\":null,\"priority\":\"Low\",\"confidence\":0.96}`;\n\n// Webhook node puts the POST body under $json.body; accept a few field names\n// so email / form / portal adapters can all post here.\nconst body = $json.body ?? $json;\nconst message = String(body.message ?? body.text ?? body.content ?? '').trim();\n\nconst request = {\n  request_id: String(body.id ?? `REQ-${Date.now()}`),\n  source: String(body.source ?? 'Unknown'),\n  received_at: new Date().toISOString(),\n  raw_message: message,\n};\n\nreturn {\n  json: {\n    ...request,\n    llm_request: {\n      model: MODEL,\n      temperature: 0,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: SYSTEM_PROMPT },\n        {\n          role: 'user',\n          content: `Source channel: ${request.source}\\nMessage:\\n\"\"\"\\n${message || '(empty message)'}\\n\"\"\"`,\n        },\n      ],\n    },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "b2940a18-0f21-5172-8dbc-896bf726b491",
+      "name": "LLM: Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "f322489e-9676-5306-bcd3-04391f27dd5d",
+      "name": "Validate Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Validates the classifier output (never trust raw LLM JSON) and builds the\n// request for STEP 3 (Enrichment).\n// Mode: Run Once for Each Item.\n\nconst MODEL = 'llama-3.3-70b-versatile';\nconst CATEGORIES = ['Bug Report', 'Feature Request', 'Billing Issue', 'Technical Question', 'Incident/Outage'];\nconst PRIORITIES = ['Low', 'Medium', 'High'];\n\nconst ENRICH_PROMPT = `You are the enrichment step of ArcVault's support intake pipeline. You receive one customer message plus the category it has already been given. Extract structured facts and write a short hand-off summary for the team that will receive it.\n\n## Rules\n- Extract identifiers EXACTLY as written in the message. Never invent, normalise or guess an identifier. If a list has nothing, return an empty list.\n- Amounts: return plain numbers (1240, not \"$1,240\"). \"charged\" = what the customer was billed; \"expected\" = what they believe they should have been billed. Use null when not stated. Do NOT calculate differences; downstream code does that.\n- urgency_signal.level reflects the language and impact in the message itself (blocked work, many users, deadlines, money), not the category.\n- urgency_signal.evidence must be a short phrase copied from the message, or null.\n- core_issue: one sentence, plain language, no customer names.\n- summary: 2-3 sentences written for the receiving internal team. Say what happened, what the customer needs, and the most useful next step. Do not promise anything to the customer and do not repeat the category label.\n\n## Output\nReturn ONLY a JSON object with exactly these keys:\n{\n  \"core_issue\": \"string\",\n  \"identifiers\": {\n    \"account_ids\": [],\n    \"invoice_numbers\": [],\n    \"error_codes\": [],\n    \"urls\": [],\n    \"products_or_features\": [],\n    \"other\": []\n  },\n  \"amounts\": { \"charged\": null, \"expected\": null, \"currency\": null },\n  \"urgency_signal\": { \"level\": \"low | medium | high\", \"evidence\": \"string or null\" },\n  \"affected_scope\": \"single user | multiple users | whole organisation | unknown\",\n  \"summary\": \"string\"\n}`;\n\nconst req = $('Prepare Classification').item.json;\nconst errors = [];\n\nlet parsed = {};\ntry {\n  parsed = JSON.parse($json.choices?.[0]?.message?.content ?? '');\n} catch (e) {\n  errors.push('classifier returned invalid JSON');\n}\n\nconst category = CATEGORIES.includes(parsed.category) ? parsed.category : null;\nif (!category) errors.push(`unknown category: ${JSON.stringify(parsed.category ?? null)}`);\n\nconst priority = PRIORITIES.includes(parsed.priority) ? parsed.priority : 'Medium';\nif (!PRIORITIES.includes(parsed.priority)) errors.push('priority missing/invalid, defaulted to Medium');\n\nlet confidence = Number(parsed.confidence);\nif (!Number.isFinite(confidence)) {\n  confidence = 0;\n  errors.push('confidence missing, set to 0');\n}\nif (confidence > 1 && confidence <= 100) confidence = confidence / 100; // model answered in %\nconfidence = Math.round(Math.min(Math.max(confidence, 0), 1) * 100) / 100;\n\nconst secondary = CATEGORIES.includes(parsed.secondary_category) ? parsed.secondary_category : null;\n\nconst classification = {\n  category,\n  secondary_category: secondary,\n  priority,\n  confidence,\n  rationale: String(parsed.rationale ?? ''),\n  validation_errors: errors,\n};\n\nreturn {\n  json: {\n    request_id: req.request_id,\n    source: req.source,\n    received_at: req.received_at,\n    raw_message: req.raw_message,\n    classification,\n    llm_request: {\n      model: MODEL,\n      temperature: 0,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: ENRICH_PROMPT },\n        {\n          role: 'user',\n          content: `Category: ${category ?? 'Unclassified'}\\nSource channel: ${req.source}\\nMessage:\\n\"\"\"\\n${req.raw_message}\\n\"\"\"`,\n        },\n      ],\n    },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "fef23b02-329a-512e-97c8-4491f83b9e45",
+      "name": "LLM: Enrich & Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "db6301b7-5e01-5c8c-878c-0db98be69b82",
+      "name": "Route & Escalate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// STEP 4 (Routing) + STEP 5 (Structured output) + STEP 6 (Escalation flag)\n// Deterministic rules only: no LLM decides where a ticket goes.\n// Mode: Run Once for Each Item.\n\nconst CONFIG = {\n  MODEL: 'llama-3.3-70b-versatile',\n  PIPELINE_VERSION: '1.0.0',\n  CONFIDENCE_THRESHOLD: 0.7,\n  BILLING_ESCALATION_USD: 500,\n  ESCALATION_QUEUE: 'Human Review',\n  ROUTES: {\n    'Bug Report': 'Engineering',\n    'Incident/Outage': 'Engineering On-Call',\n    'Feature Request': 'Product',\n    'Billing Issue': 'Billing',\n    'Technical Question': 'Technical Support',\n  },\n  // Phrases that always need a human, regardless of what the model said.\n  ESCALATION_PATTERNS: [\n    { label: 'outage', re: /\\boutage\\b/i },\n    { label: 'down for all users', re: /\\bdown for (all|every(one|body))\\b/i },\n    { label: 'multiple users affected', re: /\\b(multiple|many|all) users\\b/i },\n    { label: 'data loss', re: /\\bdata (loss|lost|deleted)\\b/i },\n    { label: 'security breach', re: /\\b(breach|compromised|unauthori[sz]ed access)\\b/i },\n  ],\n};\n\nconst prev = $('Validate Classification').item.json;\nconst c = prev.classification;\nconst notes = [...c.validation_errors];\n\n// ---- parse + sanitise enrichment output ---------------------------------\nlet e = {};\ntry {\n  e = JSON.parse($json.choices?.[0]?.message?.content ?? '');\n} catch (err) {\n  notes.push('enrichment returned invalid JSON');\n}\nconst list = (v) => (Array.isArray(v) ? v.map(String).filter(Boolean) : []);\nconst num = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(String(v).replace(/[^0-9.\\-]/g, ''));\n  return Number.isFinite(n) ? n : null;\n};\nconst ids = e.identifiers ?? {};\nconst level = ['low', 'medium', 'high'].includes(e.urgency_signal?.level) ? e.urgency_signal.level : 'medium';\n\nconst enrichment = {\n  core_issue: String(e.core_issue ?? ''),\n  identifiers: {\n    account_ids: list(ids.account_ids),\n    invoice_numbers: list(ids.invoice_numbers),\n    error_codes: list(ids.error_codes),\n    urls: list(ids.urls),\n    products_or_features: list(ids.products_or_features),\n    other: list(ids.other),\n  },\n  amounts: {\n    charged: num(e.amounts?.charged),\n    expected: num(e.amounts?.expected),\n    currency: e.amounts?.currency ?? null,\n  },\n  urgency_signal: { level, evidence: e.urgency_signal?.evidence ?? null },\n  affected_scope: String(e.affected_scope ?? 'unknown'),\n};\n\n// ---- escalation rules (STEP 6) --------------------------------------------\nconst reasons = [];\nif (!c.category) reasons.push('classification failed validation');\nif (c.confidence < CONFIG.CONFIDENCE_THRESHOLD) {\n  reasons.push(`confidence ${c.confidence} is below ${CONFIG.CONFIDENCE_THRESHOLD}`);\n}\nif (c.category === 'Incident/Outage') reasons.push('category is Incident/Outage');\nfor (const p of CONFIG.ESCALATION_PATTERNS) {\n  if (p.re.test(prev.raw_message)) reasons.push(`message matches escalation phrase \"${p.label}\"`);\n}\n// Billing: the model extracts the numbers, code does the arithmetic.\nlet billingDiscrepancy = null;\nconst { charged, expected } = enrichment.amounts;\nif (charged !== null && expected !== null) {\n  billingDiscrepancy = Math.round((charged - expected) * 100) / 100;\n  if (Math.abs(billingDiscrepancy) > CONFIG.BILLING_ESCALATION_USD) {\n    reasons.push(`billing discrepancy $${Math.abs(billingDiscrepancy)} exceeds $${CONFIG.BILLING_ESCALATION_USD}`);\n  }\n}\n\n// ---- routing (STEP 4) -----------------------------------------------------\nconst standardQueue = CONFIG.ROUTES[c.category] ?? null; // null => fallback\nconst escalate = reasons.length > 0 || !standardQueue;\nconst queue = escalate ? CONFIG.ESCALATION_QUEUE : standardQueue;\n\n// Outages are always High, whatever the model said.\nlet priority = c.priority;\nif (c.category === 'Incident/Outage' && priority !== 'High') {\n  priority = 'High';\n  notes.push('priority raised to High for Incident/Outage');\n}\n\n// ---- final record (STEP 5) ------------------------------------------------\nreturn {\n  json: {\n    request_id: prev.request_id,\n    source: prev.source,\n    received_at: prev.received_at,\n    raw_message: prev.raw_message,\n    category: c.category,\n    priority,\n    confidence: c.confidence,\n    classification_rationale: c.rationale,\n    secondary_category: c.secondary_category,\n    core_issue: enrichment.core_issue,\n    identifiers: enrichment.identifiers,\n    amounts: { ...enrichment.amounts, discrepancy: billingDiscrepancy },\n    urgency_signal: enrichment.urgency_signal,\n    affected_scope: enrichment.affected_scope,\n    routing: {\n      destination_queue: queue,\n      standard_queue: standardQueue,\n      reason: escalate\n        ? `Escalated for human review; would otherwise go to ${standardQueue ?? 'no queue (unclassified)'}.`\n        : `${c.category} -> ${standardQueue}`,\n    },\n    escalation: { flagged: escalate, reasons },\n    summary: String(e.summary ?? ''),\n    processing_notes: notes,\n    meta: {\n      model: CONFIG.MODEL,\n      pipeline_version: CONFIG.PIPELINE_VERSION,\n      processed_at: new Date().toISOString(),\n    },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "7a0ea66f-603a-5b1c-af90-b5e9aeacc569",
+      "name": "Needs Human Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "14744861-707e-54d1-a522-b19dbdfe7210",
+              "leftValue": "={{ $json.escalation.flagged }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "6f1d19f3-5b98-5cf5-a596-43093d58309a",
+      "name": "Deliver: Escalation Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        -120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://webhook.site/REPLACE-WITH-YOUR-WEBHOOK-SITE-ID",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "queue",
+              "value": "={{ $json.routing.destination_queue }}"
+            },
+            {
+              "name": "request_id",
+              "value": "={{ $json.request_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "ecba5d9a-96da-5dc5-9cf5-010519c9ecdb",
+      "name": "Deliver: Team Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://webhook.site/REPLACE-WITH-YOUR-WEBHOOK-SITE-ID",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "queue",
+              "value": "={{ $json.routing.destination_queue }}"
+            },
+            {
+              "name": "request_id",
+              "value": "={{ $json.request_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "38bb2354-9320-543b-81a1-1562137d6223",
+      "name": "Return Record",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1800,
+        0
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Route & Escalate').item.json) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Inbound Request": {
+      "main": [
+        [
+          {
+            "node": "Prepare Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Classification": {
+      "main": [
+        [
+          {
+            "node": "LLM: Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: Classify": {
+      "main": [
+        [
+          {
+            "node": "Validate Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Classification": {
+      "main": [
+        [
+          {
+            "node": "LLM: Enrich & Summarize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: Enrich & Summarize": {
+      "main": [
+        [
+          {
+            "node": "Route & Escalate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route & Escalate": {
+      "main": [
+        [
+          {
+            "node": "Needs Human Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Human Review?": {
+      "main": [
+        [
+          {
+            "node": "Deliver: Escalation Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Deliver: Team Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver: Escalation Queue": {
+      "main": [
+        [
+          {
+            "node": "Return Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver: Team Queue": {
+      "main": [
+        [
+          {
+            "node": "Return Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
